@@ -70,8 +70,8 @@
   </div>
 
   <!-- ===== 存（手机） ===== -->
-  <div class="card">
-    <h2>1 · 存照片（手机用）</h2>
+  <div class="card" id="cardUp">
+    <h2>存照片（手机用）</h2>
     <div class="codeRow">
       <input class="codeInput" id="codeUp" inputmode="numeric" maxlength="2" placeholder="00">
       <span class="tiny" style="flex:1">两位数取件码，手机与电脑保持一致<br>可手动修改，也可点右侧换一个</span>
@@ -85,8 +85,8 @@
   </div>
 
   <!-- ===== 取（电脑） ===== -->
-  <div class="card">
-    <h2>2 · 取照片（电脑用）</h2>
+  <div class="card" id="cardGet">
+    <h2>取照片（电脑用）</h2>
     <div class="codeRow">
       <input class="codeInput" id="codeGet" inputmode="numeric" maxlength="2" placeholder="00">
       <button class="btn btn-pri" id="btnOpen" style="flex:1">打开这个取件码的照片</button>
@@ -96,8 +96,8 @@
     <div class="empty" id="emptyBox" style="display:none"><span style="font-size:26px;display:block;margin-bottom:6px">📭</span>该取件码下还没有照片</div>
   </div>
 
-  <p class="tiny" style="margin-top:14px;text-align:center">
-    测试页 · 需通过 server.js 访问（同一 WiFi）· 取件码即房间号，无其他密码
+    <p class="tiny" style="margin-top:14px;text-align:center">
+    测试页 · 电脑端 localhost 取照片 · 手机端 IP 地址存照片 · 取件码即房间号，无其他密码
   </p>
 </div>
 
@@ -121,14 +121,18 @@ $('btnNewCode').addEventListener('click', ()=>{ setCode(randomCode()); toast('�
 
 /* ---------- 连接检测 ---------- */
 let serverOK=false;
+/* 角色判定：localhost / 127.0.0.1 = 电脑端（取照片）；用 IP 打开 = 手机端（存照片） */
+const IS_PC = (location.hostname==='localhost' || location.hostname==='127.0.0.1');
+$('cardUp').style.display  = IS_PC ? 'none' : '';   // 电脑端完全隐藏存照片
+$('cardGet').style.display = IS_PC ? '' : 'none';   // 手机端完全隐藏取照片
 async function detect(){
   try{
     const r=await fetch('/api/ping',{cache:'no-store'});
     const j=await r.json(); serverOK=!!(j&&j.ok);
   }catch(e){ serverOK=false; }
-  $('modeTag').textContent = serverOK? '服务已连接' : '未连接服务';
+  $('modeTag').textContent = (IS_PC? '电脑端 · 取照片' : '手机端 · 存照片') + (serverOK? ' · 服务已连接' : ' · 未连接服务');
   $('modeTag').style.color = serverOK? '#06ad56' : '#b45309';
-  if(!serverOK) $('upStatus').textContent='⚠ 未检测到 server.js 服务：直接双击打开本文件无法跨设备同步，请先启动 start-server.bat，并通过 http://电脑IP:8788/test2.html 访问。';
+  if(!serverOK) $('upStatus').textContent='⚠ 未检测到 server.js 服务：直接双击打开本文件无法跨设备同步，请先启动同步服务，再通过 http://电脑IP:8788/test.html 访问。';
 }
 
 /* ---------- 上传 ---------- */
