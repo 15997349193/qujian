@@ -1,400 +1,173 @@
 /**
- * 照片同步测试页的本地同步服务
- * 零依赖：只用 node 内置模块。
- *   - 静态文件服务（test.html 等）
- *   - REST API：/api/health、/api/photos
- *   - SSE 实时推送：/api/events
- * 启动：node server.js   或双击 start-server.cmd
+ * test.html 的本地同步服务（仅测试用，无第三方依赖）
+ * 启动：node server.js  →  手机与电脑连同一 WiFi，手机扫码即可真机同步
  */
-'use strict';
-
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 
+const PORT = Number(process.env.PORT || 8788);
 const ROOT = __dirname;
-const DATA_DIR = path.join(ROOT, '_data');
-const DATA_FILE = path.join(DATA_DIR, 'photos.json');
-const PORT = Number(process.env.PORT || 8090);
-const HOST = process.env.HOST || '0.0.0.0';
+const DATA_DIR = path.join(ROOT, 'data');
+const UP_DIR = path.join(DATA_DIR, 'uploads');
+const DB_FILE = path.join(DATA_DIR, 'photos.json');
+const MAX_BODY = 12 * 1024 * 1024;      // 单张上限 ~9MB base64
+const MAX_PHOTOS = 300;
 
-const MAX_ITEMS = 12;
-const MAX_PHOTO_BYTES = 3 * 1024 * 1024;
-const MAX_BODY_BYTES = 8 * 1024 * 1024;
+fs.mkdirSync(UP_DIR, { recursive: true });
+if (!fs.existsSync(DB_FILE)) fs.writeFileSync(DB_FILE, '[]');
 
-/* ---------------- 存储 ---------------- */
-
-let items = [];
-
-function load() {
-  try {
-    const raw = fs.readFileSync(DATA_FILE, 'utf8');
-    const obj = JSON.parse(raw);
-    items = Array.isArray(obj.items) ? obj.items.slice(0, MAX_ITEMS) : [];
-  } catch (e) {
-    items = [];
+let db = [];
+try { db = JSON.parse(fs.readFileSync(DB_FILE, 'utf8')) || []; } catch { db = []; }
+function saveDB() {
+  // 只保留最近 MAX_PHOTOS 条，同时删除超出的文件
+  if (db.length > MAX_PHOTOS) {
+    const drop = db.splice(0, db.length - MAX_PHOTOS);
+    for (const p of drop) { try { fs.unlinkSync(path.join(UP_DIR, p.file)); } catch {} }
   }
+  fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 1));
 }
 
-function save() {
-  try {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-    const tmp = DATA_FILE + '.tmp';
-    fs.writeFileSync(tmp, JSON.stringify({ items }), 'utf8');
-    fs.renameSync(tmp, DATA_FILE);
-  } catch (e) {
-    log('error', 'save failed', { message: e.message });
-  }
-}
-
-/* ---------------- 日志 ---------------- */
-
-function log(level, msg, extra) {
-  const rec = Object.assign({ ts: new Date().toISOString(), level, msg }, extra || {});
-  console.log(JSON.stringify(rec));
-}
-
-/* ---------------- SSE ---------------- */
-
+/* ---------- SSE 订阅 ---------- */
 const clients = new Set();
-
-function broadcast(payload) {
-  const frame = 'data: ' + JSON.stringify(payload) + '\n\n';
-  for (const res of clients) {
-    try { res.write(frame); } catch (e) { clients.delete(res); }
-  }
+function broadcast(msg) {
+  const line = 'data: ' + JSON.stringify(msg) + '\n\n';
+  for (const res of clients) { try { res.write(line); } catch {} }
 }
-
-function peerCount() {
-  return clients.size;
-}
-
-function broadcastPeers() {
-  broadcast({ type: 'peers', count: peerCount() });
-}
-
-/* ---------------- HTTP 工具 ---------------- */
+setInterval(() => { for (const res of clients) { try { res.write(': ping\n\n'); } catch {} } }, 25000);
 
 function json(res, code, obj) {
-  const body = JSON.stringify(obj);
-  res.writeHead(code, {
-    'Content-Type': 'application/json; charset=utf-8',
-    'Cache-Control': 'no-store',
-    'Content-Length': Buffer.byteLength(body)
-  });
+  const body = Buffer.from(JSON.stringify(obj));
+  res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Length': body.length, 'Cache-Control': 'no-store' });
   res.end(body);
 }
-
 function readBody(req) {
   return new Promise((resolve, reject) => {
-    let size = 0;
-    const chunks = [];
-    req.on('data', (c) => {
+    let size = 0; const chunks = [];
+    req.on('data', c => {
       size += c.length;
-      if (size > MAX_BODY_BYTES) {
-        reject(new Error('body too large'));
-        req.destroy();
-        return;
-      }
+      if (size > MAX_BODY) { reject(new Error('too_large')); req.destroy(); return; }
       chunks.push(c);
     });
     req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
     req.on('error', reject);
   });
 }
+const safeId = s => String(s || '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 40);
 
-const MIME = {
-  '.html': 'text/html; charset=utf-8',
-  '.js': 'text/javascript; charset=utf-8',
-  '.css': 'text/css; charset=utf-8',
-  '.json': 'application/json; charset=utf-8',
-  '.png': 'image/png',
-  '.jpg': 'image/jpeg',
-  '.jpeg': 'image/jpeg',
-  '.svg': 'image/svg+xml',
-  '.ico': 'image/x-icon',
-  '.txt': 'text/plain; charset=utf-8'
-};
+const server = http.createServer(async (req, res) => {
+  const url = new URL(req.url, 'http://' + (req.headers.host || 'localhost'));
+  const p = url.pathname;
 
-function serveStatic(req, res, pathname) {
-  let rel = decodeURIComponent(pathname);
-  if (rel === '/') rel = '/test.html';
-  const filePath = path.join(ROOT, rel);
-
-  // 防目录穿越
-  if (!filePath.startsWith(ROOT + path.sep) && filePath !== ROOT) {
-    json(res, 403, { ok: false, error: 'forbidden' });
-    return;
+  /* 页面 */
+  if (p === '/test2.html') {
+    const html = fs.readFileSync(path.join(ROOT, 'test2.html'));
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Content-Length': html.length, 'Cache-Control': 'no-store' });
+    return res.end(html);
   }
-  // 不对外暴露数据目录
-  if (filePath.startsWith(path.join(ROOT, '_data'))) {
-    json(res, 403, { ok: false, error: 'forbidden' });
-    return;
+  if (p === '/' || p === '/test.html' || p === '/index.html') {
+    const html = fs.readFileSync(path.join(ROOT, 'test.html'));
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Content-Length': html.length, 'Cache-Control': 'no-store' });
+    return res.end(html);
   }
 
-  fs.stat(filePath, (err, st) => {
-    if (err || !st.isFile()) {
-      res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
-      res.end('404 Not Found');
-      return;
-    }
-    const ext = path.extname(filePath).toLowerCase();
-    res.writeHead(200, {
-      'Content-Type': MIME[ext] || 'application/octet-stream',
-      'Content-Length': st.size,
-      'Cache-Control': ext === '.html' ? 'no-cache' : 'public, max-age=60'
-    });
-    fs.createReadStream(filePath).pipe(res);
-  });
-}
+  /* 探活：页面据此判断是否 server 模式 */
+  if (p === '/api/ping') return json(res, 200, { ok: true, mode: 'lan', photos: db.length });
 
-/* ---------------- 参数校验 ---------------- */
-
-function sanitizePhoto(p) {
-  if (!p || typeof p !== 'object') return null;
-  const dataUrl = p.dataUrl;
-  if (typeof dataUrl !== 'string') return null;
-  if (dataUrl.indexOf('data:image/') !== 0) return null;
-  if (dataUrl.length > MAX_PHOTO_BYTES) return null;
-
-  const clampStr = (v, max) => (typeof v === 'string' ? v.slice(0, max) : '');
-
-  return {
-    id: clampStr(p.id, 64) || 'p' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7),
-    dataUrl,
-    w: Number.isFinite(p.w) ? Math.max(1, Math.min(8000, Math.round(p.w))) : 0,
-    h: Number.isFinite(p.h) ? Math.max(1, Math.min(8000, Math.round(p.h))) : 0,
-    ts: Number.isFinite(p.ts) ? p.ts : Date.now(),
-    from: clampStr(p.from, 64),
-    fromRole: p.fromRole === 'pc' ? 'pc' : 'phone',
-    owner: clampStr(p.owner, 40) || '微信用户',
-    source: clampStr(p.source, 120) || 'photo.jpg'
-  };
-}
-
-function upsert(photo) {
-  const i = items.findIndex((x) => x.id === photo.id);
-  if (i >= 0) items[i] = photo; else items.unshift(photo);
-  items.sort((a, b) => b.ts - a.ts);
-  if (items.length > MAX_ITEMS) items.length = MAX_ITEMS;
-}
-
-/* ---------------- 路由 ---------------- */
-
-const server = http.createServer((req, res) => {
-  const started = Date.now();
-  let url;
-  try {
-    url = new URL(req.url, 'http://' + (req.headers.host || 'localhost'));
-  } catch (e) {
-    json(res, 400, { ok: false, error: 'bad request' });
-    return;
+  /* 列表 */
+  if (p === '/api/photos' && req.method === 'GET') {
+    const room = url.searchParams.get('room') || 'test';
+    const list = db.filter(x => x.room === room).map(({ id, file, from, userName, name, ts, w, h, room }) =>
+      ({ id, file, from, userName, name, ts, w, h, room }));
+    return json(res, 200, { photos: list });
   }
-  const pathname = url.pathname;
 
-  res.on('finish', () => {
-    if (pathname.startsWith('/api/')) {
-      log('info', 'api', { method: req.method, path: pathname, status: res.statusCode, ms: Date.now() - started });
-    }
-  });
+  /* 上传 */
+  if (p === '/api/upload' && req.method === 'POST') {
+    let body;
+    try { body = await readBody(req); }
+    catch { return json(res, 413, { error: '图片太大，请压缩后重试' }); }
 
-  // ---- SSE ----
-  if (pathname === '/api/events') {
+    let payload;
+    try { payload = JSON.parse(body); } catch { return json(res, 400, { error: 'bad json' }); }
+
+    const dataUrl = String(payload.dataUrl || '');
+    const m = dataUrl.match(/^data:image\/(jpeg|jpg|png|webp);base64,([A-Za-z0-9+/=]+)$/);
+    if (!m) return json(res, 400, { error: '仅支持 jpeg/png/webp 图片' });
+
+    const ext = m[1] === 'jpg' ? 'jpeg' : m[1];
+    const id = safeId(payload.id) || ('p' + Date.now().toString(36));
+    const file = id + '.' + (ext === 'jpeg' ? 'jpg' : ext);
+    const buf = Buffer.from(m[2], 'base64');
+    if (buf.length > 8 * 1024 * 1024) return json(res, 413, { error: '图片超过 8MB' });
+
+    fs.writeFileSync(path.join(UP_DIR, file), buf);
+    const photo = {
+      id, file,
+      from: payload.from === 'mobile' ? 'mobile' : 'desktop',
+      userName: String(payload.userName || '匿名').slice(0, 20),
+      openid: String(payload.openid || '').slice(0, 40),
+      name: String(payload.name || '').slice(0, 80),
+      room: String(payload.room || 'test').slice(0, 24),
+      ts: Number(payload.ts) || Date.now(),
+      w: Number(payload.w) || 0, h: Number(payload.h) || 0
+    };
+    db.push(photo); saveDB();
+    broadcast({ type: 'add', photo });
+    return json(res, 200, { ok: true, photo });
+  }
+
+  /* 实时推送 */
+  if (p === '/api/events' && req.method === 'GET') {
     res.writeHead(200, {
       'Content-Type': 'text/event-stream; charset=utf-8',
       'Cache-Control': 'no-cache, no-transform',
       Connection: 'keep-alive',
       'X-Accel-Buffering': 'no'
     });
-    res.write('retry: 2000\n\n');
-    res.write('data: ' + JSON.stringify({ type: 'hello', count: peerCount() + 1 }) + '\n\n');
+    res.write(': connected\n\n');
     clients.add(res);
-    broadcastPeers();
-
-    const ping = setInterval(() => {
-      try { res.write(': ping\n\n'); } catch (e) { /* ignore */ }
-    }, 15000);
-
-    req.on('close', () => {
-      clearInterval(ping);
-      clients.delete(res);
-      broadcastPeers();
-    });
+    req.on('close', () => clients.delete(res));
     return;
   }
 
-  // ---- AI 视觉复核代理 ----
-  // 免费视觉大模型（默认智谱 GLM-4V-Flash）需要 API Key；key 只保存在服务端环境变量里，
-  // 网页不接触 key。未配置时返回 503，页面优雅降级为纯本地识别。
-  // 配置方法（启动前）：
-  //   set VISION_API_KEY=你的key        （智谱开放平台 https://open.bigmodel.cn 免费领取）
-  //   set VISION_MODEL=glm-4v-flash     （可选，默认 glm-4v-flash）
-  //   set VISION_BASE_URL=https://open.bigmodel.cn/api/paas/v4/chat/completions （可选）
-  if (pathname === '/api/vision' && req.method === 'POST') {
-    const API_KEY = process.env.VISION_API_KEY || '';
-    if (!API_KEY) {
-      json(res, 503, { ok: false, error: 'not-configured',
-        hint: '未配置视觉模型 Key。请设置环境变量 VISION_API_KEY 后重启服务。' });
-      return;
+  /* 图片 */
+  if (p.startsWith('/uploads/')) {
+    const name = path.basename(p);
+    const fp = path.join(UP_DIR, name);
+    if (!fp.startsWith(UP_DIR) || !fs.existsSync(fp)) { res.writeHead(404); return res.end('not found'); }
+    const ext = path.extname(fp).slice(1).toLowerCase();
+    const type = ext === 'png' ? 'image/png' : ext === 'webp' ? 'image/webp' : 'image/jpeg';
+    const st = fs.statSync(fp);
+    res.writeHead(200, { 'Content-Type': type, 'Content-Length': st.size, 'Cache-Control': 'public, max-age=86400' });
+    return fs.createReadStream(fp).pipe(res);
+  }
+
+  res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+  res.end('404');
+});
+
+function lanIPs() {
+  const out = [];
+  for (const list of Object.values(os.networkInterfaces())) {
+    for (const it of list || []) {
+      if (it.family === 'IPv4' && !it.internal) out.push(it.address);
     }
-    readBody(req).then(async (raw) => {
-      let body;
-      try { body = JSON.parse(raw || '{}'); } catch (e) {
-        json(res, 400, { ok: false, error: 'invalid json' });
-        return;
-      }
-      const images = (Array.isArray(body.images) ? body.images : [])
-        .filter((s) => typeof s === 'string' && /^data:image\/(png|jpeg);base64,/.test(s))
-        .slice(0, 2);
-      if (!images.length) {
-        json(res, 400, { ok: false, error: 'no images' });
-        return;
-      }
-      const BASE = process.env.VISION_BASE_URL || 'https://open.bigmodel.cn/api/paas/v4/chat/completions';
-      const MODEL = process.env.VISION_MODEL || 'glm-4v-flash';
-      const content = [
-        { type: 'text', text:
-          '这是同一颗三阶魔方的照片（最多2张，每张可见3个面）。请仔细读出每个可见面的9个贴纸颜色。' +
-          '颜色只能是：白、黄、红、橙、绿、蓝 之一。每个面的中心块颜色决定该面的名称。' +
-          '严格只输出 JSON，不要输出任何其他文字，格式：' +
-          '{"faces":[{"center":"中心块颜色","colors":["9个贴纸颜色，按从左到右、从上到下的顺序，不含中心块以外的标点"]}]}' }
-      ];
-      for (const dataUrl of images) {
-        content.push({ type: 'image_url', image_url: { url: dataUrl } });
-      }
-      const payload = JSON.stringify({
-        model: MODEL,
-        messages: [{ role: 'user', content }],
-        temperature: 0.1
-      });
-      const up = new URL(BASE);
-      const reqOpt = {
-        hostname: up.hostname, port: up.port || 443, path: up.pathname + up.search, method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${API_KEY}`,
-          'Content-Length': Buffer.byteLength(payload) }
-      };
-      const result = await new Promise((resolve) => {
-        const mod = up.protocol === 'http:' ? require('http') : require('https');
-        const r = mod.request(reqOpt, (resp) => {
-          let data = '';
-          resp.on('data', (c) => { data += c; });
-          resp.on('end', () => {
-            try {
-              const j = JSON.parse(data);
-              const text = j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content || '';
-              const m = text.match(/\{[\s\S]*\}/);
-              resolve(resp.statusCode === 200 && m ? { ok: true, faces: JSON.parse(m[0]).faces } :
-                { ok: false, error: 'bad response', status: resp.statusCode, text: String(text).slice(0, 200) });
-            } catch (e) { resolve({ ok: false, error: 'parse fail', text: String(data).slice(0, 200) }); }
-          });
-        });
-        r.on('error', (e) => resolve({ ok: false, error: 'request fail: ' + e.message }));
-        r.setTimeout(30000, () => { r.destroy(); resolve({ ok: false, error: 'timeout' }); });
-        r.write(payload); r.end();
-      });
-      json(res, result.ok ? 200 : 502, result);
-    }).catch((e) => json(res, 500, { ok: false, error: e.message }));
-    return;
   }
+  return out;
+}
 
-  // ---- API ----
-  if (pathname === '/api/health') {
-    json(res, 200, { ok: true, mode: 'server', items: items.length, peers: peerCount(),
-      vision: !!(process.env.VISION_API_KEY), ts: Date.now() });
-    return;
+server.listen(PORT, '0.0.0.0', () => {
+  const ips = lanIPs();
+  console.log('\n  拍照同步测试服务已启动');
+  console.log('  本机：http://localhost:' + PORT + '/test.html');
+  if (ips.length) {
+    console.log('  局域网（手机用这个）：');
+    for (const ip of ips) console.log('    http://' + ip + ':' + PORT + '/test.html');
+    console.log('\n  手机与电脑需连同一个 WiFi；首次可能需要在 Windows 防火墙放行 Node。');
+  } else {
+    console.log('  未检测到局域网 IP，请检查网络连接。');
   }
-
-  if (pathname === '/api/photos' && req.method === 'GET') {
-    json(res, 200, { ok: true, items });
-    return;
-  }
-
-  if (pathname === '/api/photos' && req.method === 'POST') {
-    readBody(req).then((raw) => {
-      let body;
-      try { body = JSON.parse(raw || '{}'); } catch (e) {
-        json(res, 400, { ok: false, error: 'invalid json' });
-        return;
-      }
-      const photo = sanitizePhoto(body.photo || body);
-      if (!photo) {
-        json(res, 400, { ok: false, error: 'invalid photo' });
-        return;
-      }
-      if (items.length >= MAX_ITEMS && !items.some((x) => x.id === photo.id)) {
-        json(res, 409, { ok: false, error: 'storage full', max: MAX_ITEMS });
-        return;
-      }
-      upsert(photo);
-      save();
-      broadcast({ type: 'photo', photo });
-      json(res, 200, { ok: true, item: photo, total: items.length });
-    }).catch((e) => {
-      json(res, 413, { ok: false, error: e.message });
-    });
-    return;
-  }
-
-  if (pathname === '/api/photos/clear' && req.method === 'POST') {
-    items = [];
-    save();
-    broadcast({ type: 'clear' });
-    json(res, 200, { ok: true });
-    return;
-  }
-
-  if (pathname.startsWith('/api/photos/') && req.method === 'DELETE') {
-    const id = decodeURIComponent(pathname.slice('/api/photos/'.length));
-    const before = items.length;
-    items = items.filter((x) => x.id !== id);
-    if (items.length === before) {
-      json(res, 404, { ok: false, error: 'not found' });
-      return;
-    }
-    save();
-    broadcast({ type: 'delete', id });
-    json(res, 200, { ok: true });
-    return;
-  }
-
-  if (pathname.startsWith('/api/')) {
-    json(res, 404, { ok: false, error: 'no such api' });
-    return;
-  }
-
-  // ---- 静态 ----
-  serveStatic(req, res, pathname);
-});
-
-load();
-server.listen(PORT, HOST, () => {
-  const nets = require('os').networkInterfaces();
-  const addrs = [];
-  Object.keys(nets).forEach((k) => {
-    (nets[k] || []).forEach((n) => {
-      if (n.family === 'IPv4' && !n.internal) addrs.push(n.address);
-    });
-  });
-  log('info', 'server started', { port: PORT, addrs });
   console.log('');
-  console.log('  电脑端: http://localhost:' + PORT + '/test.html');
-  addrs.forEach((a) => console.log('  手机端: http://' + a + ':' + PORT + '/test.html'));
-  console.log('');
-});
-
-process.on('SIGINT', () => {
-  log('info', 'shutting down');
-  server.close(() => process.exit(0));
-});
-
-server.on('error', (err) => {
-  if (err.code === 'EADDRINUSE') {
-    console.error('');
-    console.error('  端口 ' + PORT + ' 已被占用：同步服务可能已经在运行了。');
-    console.error('  请直接使用已经打开的那个窗口，或关闭旧窗口后重新启动。');
-    console.error('');
-    process.exit(1);
-  }
-  console.error('  服务启动失败：' + err.message);
-  process.exit(1);
 });
